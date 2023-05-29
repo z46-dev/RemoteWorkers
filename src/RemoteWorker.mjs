@@ -1,5 +1,4 @@
 import * as WebSocket from "ws";
-
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
@@ -21,7 +20,43 @@ function decode(packet) {
     return JSON.parse(textDecoder.decode(packet));
 }
 
-class RemoteWorker {
+/**
+ * Events list that can be emitted by a Client or RemoteWorker.
+ * @readonly
+ * @enum {number}
+ * @property {number} OPEN The connection has been opened.
+ * @property {number} CLOSE The connection has been closed.
+ * @property {number} MESSAGE A message has been received.
+ * @property {number} ERROR An error has occurred.
+ * @property {number} SUCCESSFUL_LOGON A successful logon has occurred.
+ * @property {number} FAILED_LOGON A failed logon has occurred.
+ */
+export const events = {
+    OPEN: 0,
+    CLOSE: 1,
+    MESSAGE: 2,
+    ERROR: 3,
+    SUCCESSFUL_LOGON: 4,
+    FAILED_LOGON: 5
+};
+
+const reverseObjectEvents = Object.entries(events).reduce((acc, [key, value]) => {
+    acc[value] = key;
+    return acc;
+}, {});
+
+/**
+ * Packets list that can be sent by a Client or RemoteWorker, these are the default packets.
+ * @readonly
+ * @enum {number}
+ * @property {number} LOGIN The login packet.
+ */
+export const packets = {
+    LOGIN: 0x00
+};
+
+// Client Architecture
+export class RemoteWorker {
     #events = {};
 
     /**
@@ -42,11 +77,9 @@ class RemoteWorker {
      * @private
      */
     #onopen() {
-        this.#emit("open");
-        this.on("invalidLogin", function(payload) {
-            throw new Error("Failed to log in: " + payload);
-        });
-        this.send("login", {
+        this.#emit(events.OPEN);
+
+        this.send(packets.LOGIN, {
             username: this.username,
             password: this.password
         });
@@ -60,15 +93,18 @@ class RemoteWorker {
      */
     #onmessage(event) {
         const packet = decode(event.data);
-        if (packet.type === "login") {
+
+        if (packet.type === packets.LOGIN) {
             if (packet.payload.success) {
-                this.#emit("authorized");
-            } else {
-                throw new Error("Failed to log in: " + packet.payload.reason);
+                this.#emit(events.SUCCESSFUL_LOGON);
+                return;
             }
+
+            this.#emit(events.FAILED_LOGON);
             return;
         }
-        this.#emit("message", packet);
+
+        this.#emit(events.MESSAGE, packet);
     }
 
     /**
@@ -77,7 +113,7 @@ class RemoteWorker {
      * @private
      */
     #onclose() {
-        this.#emit("close");
+        this.#emit(events.CLOSE);
     }
 
     /**
@@ -87,14 +123,14 @@ class RemoteWorker {
      * @param {string} username The username you will log in with
      * @param {string} password The password you will log in with
      */
-    constructor(host, port, username, password) {
+    constructor(host, port, username, password, https = false) {
         this.host = host;
         this.port = port;
         this.username = username;
         this.password = password;
         this.packetIndex = 0;
 
-        this.webSocket = new WebSocket(`ws://${this.host}:${this.port}`);
+        this.webSocket = new WebSocket.WebSocket(`${https ? "wss" : "ws"}://${this.host}:${this.port}`);
         this.webSocket.binaryType = "arraybuffer";
         this.webSocket.onopen = () => this.#onopen();
         this.webSocket.onmessage = (event) => this.#onmessage(event);
@@ -108,6 +144,10 @@ class RemoteWorker {
      * @returns {void}
      */
     on(event, callback) {
+        if (reverseObjectEvents[event] === undefined) {
+            throw new Error(`Event ${event} does not exist.`);
+        }
+
         this.#events[event] = callback;
     }
 
@@ -121,18 +161,23 @@ class RemoteWorker {
         if (this.webSocket.readyState !== this.webSocket.OPEN) {
             return;
         }
+
         const packet = encode({
             type: packetType,
             payload: payload
         });
+
         this.webSocket.send(packet, {
             binary: true
         });
     }
 }
 
-let clientID = 0;
-class Client {
+// Server Architecture
+export class RemoteServerClient {
+    static idCounter = 0;
+
+    #username; // Provided with a getter, no setter
     #events = {};
 
     /**
@@ -155,24 +200,32 @@ class Client {
      */
     #onmessage(message) {
         const packet = decode(message.data);
-        if (packet.type === "login") {
+
+        if (packet.type === packets.LOGIN) {
             if (this.server.tryLogin(packet.payload.username, packet.payload.password)) {
                 this.loggedIn = true;
-                this.#emit("parentEmit", "successfulLogon", packet.payload.username);
-                this.send("login", {
+                this.#username = packet.payload.username;
+
+                this.#emit(events.SUCCESSFUL_LOGON, packet.payload.username);
+
+                this.send(packets.LOGIN, {
                     success: true
                 });
-            } else {
-                this.#emit("parentEmit", "failedLogon", packet.payload.username);
-                this.send("login", {
-                    success: false,
-                    reason: "Invalid credentials"
-                });
-                this.socket.terminate();
+                return;
             }
+
+            this.#emit(events.FAILED_LOGON, packet.payload.username);
+
+            this.send(packets.LOGIN, {
+                success: false,
+                reason: "Invalid credentials"
+            });
+
+            this.socket.terminate();
             return;
         }
-        this.#emit("message", packet);
+
+        this.#emit(events.MESSAGE, packet);
     }
 
     /**
@@ -181,21 +234,24 @@ class Client {
      * @private
      */
     #onclose() {
+        this.server.logout(this.#username);
+
         this.server.clients.delete(this.id);
-        this.#emit("close");
+
+        this.#emit(events.CLOSE);
     }
 
     /**
      * Create a new Client instance.
-     * @param {object} socket The actual WebSocket connection 
-     * @param {object} request The request object containing headers and other information
+     * @param {WebSocket} socket The actual WebSocket connection 
+     * @param {WebSocket.Connection} request The request object containing headers and other information
      * @param {RemoteServer} server The remote server instance 
      */
     constructor(socket, request, server) {
         this.socket = socket;
         this.request = request;
         this.server = server;
-        this.id = clientID ++;
+        this.id = RemoteServerClient.idCounter ++;
 
         this.socket.binaryType = "arrayBuffer";
         this.socket.onmessage = (event) => this.#onmessage(event);
@@ -210,6 +266,10 @@ class Client {
      * @returns {void}
      */
     on(event, callback) {
+        if (reverseObjectEvents[event] === undefined) {
+            throw new Error(`Event ${event} does not exist.`);
+        }
+
         this.#events[event] = callback;
     }
 
@@ -223,10 +283,12 @@ class Client {
         if (this.socket.readyState !== this.socket.OPEN) {
             return;
         }
+
         const packet = encode({
             type: packetType,
             payload: payload
         });
+
         this.socket.send(packet, {
             binary: true
         });
@@ -271,7 +333,7 @@ class Logon {
     }
 }
 
-class RemoteServer {
+export class RemoteServer {
     #events = {};
     #logons = {};
 
@@ -286,7 +348,7 @@ class RemoteServer {
             this.#events[event](...args);
         }
     }
-    
+
     /**
      * Create a connection and add it to the server's client list
      * @param {object} socket The actual WebSocket connection
@@ -295,12 +357,11 @@ class RemoteServer {
      * @private
      */
     #addConnection(socket, request) {
-        const client = new Client(socket, request, this);
-        client.on("parentEmit", (event, ...args) => {
-            this.#emit(event, ...args);
-        });
+        const client = new RemoteServerClient(socket, request, this);
+
         this.clients.set(client.id, client);
-        this.#emit("connection", client);
+
+        this.#emit(events.OPEN, client);
     }
 
     /**
@@ -310,10 +371,15 @@ class RemoteServer {
      */
     constructor(port) {
         this.port = port;
-        this.server = new WebSocket.Server({
+
+        this.server = new WebSocket.WebSocketServer({
             port: port
         });
-        this.server.on("connection", (socket, request) => this.#addConnection(socket, request));
+
+        this.server.on("connection", (socket, request) => {
+            this.#addConnection(socket, request);
+        });
+        
         this.clients = new Map();
     }
 
@@ -324,6 +390,10 @@ class RemoteServer {
      * @returns {void}
      */
     on(event, callback) {
+        if (reverseObjectEvents[event] === undefined) {
+            throw new Error(`Event ${event} does not exist.`);
+        }
+
         this.#events[event] = callback;
     }
 
@@ -338,6 +408,19 @@ class RemoteServer {
     }
 
     /**
+     * Remove a logon from the server.
+     * @param {string} username The username
+     * @returns {void}
+     */
+    logout(username) {
+        if (this.#logons[username] === undefined) {
+            return;
+        }
+
+        this.#logons[username].logout();
+    }
+
+    /**
      * Attempt to login with the given credentials.
      * @param {string} username The username
      * @param {string} password The password
@@ -347,66 +430,9 @@ class RemoteServer {
         if (this.#logons[username] === undefined) {
             return false;
         }
+
         return this.#logons[username].login(username, password);
     }
 }
-
-Object.defineProperty(RemoteWorker, "RemoteWorker", {
-    value: RemoteWorker,
-    writable: false,
-    enumerable: false,
-    configurable: false
-});
-
-Object.defineProperty(RemoteWorker, "RemoteServer", {
-    value: RemoteServer,
-    writable: false,
-    enumerable: false,
-    configurable: false
-});
-
-Object.defineProperty(RemoteWorker, "createdAt", {
-    value: new Date(),
-    writable: false,
-    enumerable: false,
-    configurable: false
-});
-
-Object.defineProperty(RemoteWorker, "encode", {
-    value: encode,
-    writable: false,
-    enumerable: false,
-    configurable: false
-});
-
-Object.defineProperty(RemoteWorker, "decode", {
-    value: decode,
-    writable: false,
-    enumerable: false,
-    configurable: false
-});
-
-Object.defineProperty(RemoteWorker, "events", {
-    value: {
-        [RemoteServer.name]: [
-            "connection",
-            "failedLogon",
-            "successfulLogon"
-        ],
-        [Client.name]: [
-            "message",
-            "close"
-        ],
-        [RemoteWorker.name]: [
-            "open",
-            "authorized",
-            "message",
-            "close"
-        ]
-    },
-    writable: false,
-    enumerable: false,
-    configurable: false
-});
 
 export default RemoteWorker;
